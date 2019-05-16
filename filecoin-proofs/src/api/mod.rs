@@ -16,11 +16,13 @@ use ffi_toolkit::rust_str_to_c_str;
 use ffi_toolkit::{c_str_to_rust_str, raw_ptr};
 use sector_base::api::bytes_amount::UnpaddedBytesAmount;
 use sector_base::api::porep_config::PoRepConfig;
-use sector_base::api::porep_config::PoRepProofPartitions;
+use sector_base::api::porep_proof_partitions;
+use sector_base::api::porep_proof_partitions::PoRepProofPartitions;
 use sector_base::api::post_config::PoStConfig;
-use sector_base::api::post_config::PoStProofPartitions;
+use sector_base::api::post_proof_partitions::PoStProofPartitions;
 use sector_base::api::sector_class::SectorClass;
 use sector_base::api::sector_size::SectorSize;
+use sector_base::api::SINGLE_PARTITION_PROOF_LEN;
 
 pub mod internal;
 pub mod post_adapter;
@@ -29,9 +31,10 @@ mod sector_builder;
 
 /// Verifies the output of seal.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn verify_seal(
-    sector_size: FFISectorSize,
+    sector_size: u64,
     comm_r: &[u8; 32],
     comm_d: &[u8; 32],
     comm_r_star: &[u8; 32],
@@ -42,40 +45,41 @@ pub unsafe extern "C" fn verify_seal(
 ) -> *mut responses::VerifySealResponse {
     info!(FCP_LOG, "verify_seal: {}", "start"; "target" => "FFI");
 
-    let mut response: responses::VerifySealResponse = Default::default();
+    let porep_bytes = try_into_porep_proof_bytes(proof_ptr, proof_len);
 
-    let proof = from_raw_parts(proof_ptr, proof_len);
+    let result = porep_bytes.and_then(|bs| {
+        porep_proof_partitions::try_from_bytes(&bs).and_then(|ppp| {
+            let cfg = PoRepConfig(SectorSize(sector_size), ppp);
 
-    let _ = try_into_porep_config(sector_size, proof_len)
-        .map_err(|err| {
-            response.status_code = FCPResponseStatus::FCPCallerError;
-            response.error_msg = rust_str_to_c_str(err);
-        })
-        .map(|porep_config| {
-            match internal::verify_seal(
-                porep_config,
+            internal::verify_seal(
+                cfg,
                 *comm_r,
                 *comm_d,
                 *comm_r_star,
                 prover_id,
                 sector_id,
-                proof,
-            ) {
-                Ok(true) => {
-                    response.status_code = FCPResponseStatus::FCPNoError;
-                    response.is_valid = true;
-                }
-                Ok(false) => {
-                    response.status_code = FCPResponseStatus::FCPNoError;
-                    response.is_valid = false;
-                }
-                Err(err) => {
-                    let (code, ptr) = err_code_and_msg(&err);
-                    response.status_code = code;
-                    response.error_msg = ptr;
-                }
-            }
-        });
+                &bs,
+            )
+        })
+    });
+
+    let mut response = responses::VerifySealResponse::default();
+
+    match result {
+        Ok(true) => {
+            response.status_code = FCPResponseStatus::FCPNoError;
+            response.is_valid = true;
+        }
+        Ok(false) => {
+            response.status_code = FCPResponseStatus::FCPNoError;
+            response.is_valid = false;
+        }
+        Err(err) => {
+            let (code, ptr) = err_code_and_msg(&err);
+            response.status_code = code;
+            response.error_msg = ptr;
+        }
+    };
 
     info!(FCP_LOG, "verify_seal: {}", "finish"; "target" => "FFI");
 
@@ -84,6 +88,7 @@ pub unsafe extern "C" fn verify_seal(
 
 /// Generates a proof-of-spacetime for the given replica commitments.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn generate_post(
     ptr: *mut SectorBuilder,
@@ -93,27 +98,23 @@ pub unsafe extern "C" fn generate_post(
 ) -> *mut responses::GeneratePoStResponse {
     info!(FCP_LOG, "generate_post: {}", "start"; "target" => "FFI");
 
-    let comm_rs = from_raw_parts(flattened_comm_rs_ptr, flattened_comm_rs_len)
-        .iter()
-        .step_by(32)
-        .fold(Default::default(), |mut acc: Vec<[u8; 32]>, item| {
-            let sliced = from_raw_parts(item, 32);
-            let mut x: [u8; 32] = Default::default();
-            x.copy_from_slice(&sliced[..32]);
-            acc.push(x);
-            acc
-        });
+    let comm_rs = into_commitments(flattened_comm_rs_ptr, flattened_comm_rs_len);
 
-    let mut response: responses::GeneratePoStResponse = Default::default();
+    let result = (*ptr).generate_post(&comm_rs, challenge_seed);
 
-    match (*ptr).generate_post(&comm_rs, challenge_seed) {
+    let mut response = responses::GeneratePoStResponse::default();
+
+    match result {
         Ok(GeneratePoStDynamicSectorsCountOutput { proofs, faults }) => {
             response.status_code = FCPResponseStatus::FCPNoError;
 
             let flattened_proofs: Vec<u8> = proofs.iter().flat_map(|x| x.iter().cloned()).collect();
-
             response.flattened_proofs_len = flattened_proofs.len();
             response.flattened_proofs_ptr = flattened_proofs.as_ptr();
+
+            let class = (*ptr).get_sector_class();
+            let PoStProofPartitions(n) = PoStProofPartitions::from(PoStConfig::from(class));
+            response.proof_partitions = n;
 
             response.faults_len = faults.len();
             response.faults_ptr = faults.as_ptr();
@@ -136,9 +137,11 @@ pub unsafe extern "C" fn generate_post(
 
 /// Verifies that a proof-of-spacetime is valid.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn verify_post(
-    sector_size: FFISectorSize,
+    sector_size: u64,
+    proof_partitions: u8,
     flattened_comm_rs_ptr: *const u8,
     flattened_comm_rs_len: libc::size_t,
     challenge_seed: &[u8; 32],
@@ -146,65 +149,40 @@ pub unsafe extern "C" fn verify_post(
     flattened_proofs_len: libc::size_t,
     faults_ptr: *const u64,
     faults_len: libc::size_t,
-    single_proof_length: libc::size_t,
 ) -> *mut responses::VerifyPoSTResponse {
     info!(FCP_LOG, "verify_post: {}", "start"; "target" => "FFI");
 
-    let mut response: responses::VerifyPoSTResponse = Default::default();
+    let post_bytes =
+        try_into_post_proofs_bytes(proof_partitions, flattened_proofs_ptr, flattened_proofs_len);
 
-    let proofs = from_raw_parts(flattened_proofs_ptr, flattened_proofs_len)
-        .iter()
-        .step_by(single_proof_length)
-        .fold(Default::default(), |mut acc: Vec<Vec<u8>>, item| {
-            let sliced = from_raw_parts(item, single_proof_length);
-            acc.push(sliced.to_vec());
-            acc
-        });
+    let result = post_bytes.and_then(|bs| {
+        let cfg = PoStConfig(
+            SectorSize(sector_size),
+            PoStProofPartitions(proof_partitions),
+        );
 
-    let _ = try_into_post_config(sector_size, single_proof_length)
-        .map_err(|err| {
-            response.status_code = FCPResponseStatus::FCPCallerError;
-            response.error_msg = rust_str_to_c_str(err);
+        internal::verify_post(VerifyPoStDynamicSectorsCountInput {
+            post_config: cfg,
+            comm_rs: into_commitments(flattened_comm_rs_ptr, flattened_comm_rs_len),
+            challenge_seed: into_safe_challenge_seed(challenge_seed),
+            proofs: bs,
+            faults: from_raw_parts(faults_ptr, faults_len).to_vec(),
         })
-        .map(|post_config| {
-            let comm_rs = from_raw_parts(flattened_comm_rs_ptr, flattened_comm_rs_len)
-                .iter()
-                .step_by(32)
-                .fold(Default::default(), |mut acc: Vec<[u8; 32]>, item| {
-                    let sliced = from_raw_parts(item, 32);
-                    let mut x: [u8; 32] = Default::default();
-                    x.copy_from_slice(&sliced[..32]);
-                    acc.push(x);
-                    acc
-                });
+    });
 
-            let faults = from_raw_parts(faults_ptr, faults_len);
+    let mut response = responses::VerifyPoSTResponse::default();
 
-            let safe_challenge_seed = {
-                let mut cs = [0; 32];
-                cs.copy_from_slice(challenge_seed);
-                cs[31] &= 0b00111111;
-                cs
-            };
-
-            match internal::verify_post(VerifyPoStDynamicSectorsCountInput {
-                post_config,
-                comm_rs,
-                challenge_seed: safe_challenge_seed,
-                proofs,
-                faults: faults.to_vec(),
-            }) {
-                Ok(dynamic) => {
-                    response.status_code = FCPResponseStatus::FCPNoError;
-                    response.is_valid = dynamic.is_valid;
-                }
-                Err(err) => {
-                    let (code, ptr) = err_code_and_msg(&err);
-                    response.status_code = code;
-                    response.error_msg = ptr;
-                }
-            }
-        });
+    match result {
+        Ok(dynamic) => {
+            response.status_code = FCPResponseStatus::FCPNoError;
+            response.is_valid = dynamic.is_valid;
+        }
+        Err(err) => {
+            let (code, ptr) = err_code_and_msg(&err);
+            response.status_code = code;
+            response.error_msg = ptr;
+        }
+    }
 
     info!(FCP_LOG, "verify_post: {}", "finish"; "target" => "FFI");
 
@@ -213,6 +191,7 @@ pub unsafe extern "C" fn verify_post(
 
 /// Initializes and returns a SectorBuilder.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn init_sector_builder(
     sector_class: FFISectorClass,
@@ -223,17 +202,19 @@ pub unsafe extern "C" fn init_sector_builder(
     staged_sector_dir: *const libc::c_char,
     max_num_staged_sectors: u8,
 ) -> *mut responses::InitSectorBuilderResponse {
-    let mut response: responses::InitSectorBuilderResponse = Default::default();
-
-    match SectorBuilder::init_from_metadata(
-        sector_class.into(),
+    let result = SectorBuilder::init_from_metadata(
+        from_ffi_sector_class(sector_class),
         last_used_sector_id,
         c_str_to_rust_str(metadata_dir).to_string(),
         *prover_id,
         c_str_to_rust_str(sealed_sector_dir).to_string(),
         c_str_to_rust_str(staged_sector_dir).to_string(),
         max_num_staged_sectors,
-    ) {
+    );
+
+    let mut response = responses::InitSectorBuilderResponse::default();
+
+    match result {
         Ok(sb) => {
             response.status_code = FCPResponseStatus::FCPNoError;
             response.sector_builder = raw_ptr(sb);
@@ -250,6 +231,7 @@ pub unsafe extern "C" fn init_sector_builder(
 
 /// Destroys a SectorBuilder.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn destroy_sector_builder(ptr: *mut SectorBuilder) {
     let _ = Box::from_raw(ptr);
@@ -257,14 +239,16 @@ pub unsafe extern "C" fn destroy_sector_builder(ptr: *mut SectorBuilder) {
 
 /// Returns the number of user bytes that will fit into a staged sector.
 ///
+#[allow(dead_code)]
 #[no_mangle]
-pub unsafe extern "C" fn get_max_user_bytes_per_staged_sector(sector_size: FFISectorSize) -> u64 {
-    u64::from(UnpaddedBytesAmount::from(SectorSize::from(sector_size)))
+pub unsafe extern "C" fn get_max_user_bytes_per_staged_sector(sector_size: u64) -> u64 {
+    u64::from(UnpaddedBytesAmount::from(SectorSize(sector_size)))
 }
 
 /// Writes user piece-bytes to a staged sector and returns the id of the sector
 /// to which the bytes were written.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn add_piece(
     ptr: *mut SectorBuilder,
@@ -298,6 +282,7 @@ pub unsafe extern "C" fn add_piece(
 
 /// Unseals and returns the bytes associated with the provided piece key.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn read_piece_from_sealed_sector(
     ptr: *mut SectorBuilder,
@@ -326,6 +311,7 @@ pub unsafe extern "C" fn read_piece_from_sealed_sector(
 
 /// For demo purposes. Seals all staged sectors.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn seal_all_staged_sectors(
     ptr: *mut SectorBuilder,
@@ -349,6 +335,7 @@ pub unsafe extern "C" fn seal_all_staged_sectors(
 /// Returns sector sealing status for the provided sector id if it exists. If
 /// we don't know about the provided sector id, produce an error.
 ///
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn get_seal_status(
     ptr: *mut SectorBuilder,
@@ -378,8 +365,8 @@ pub unsafe extern "C" fn get_seal_status(
                     response.comm_r_star = meta.comm_r_star;
                     response.pieces_len = pieces.len();
                     response.pieces_ptr = pieces.as_ptr();
-                    response.proofs_len = meta.proof.len();
-                    response.proofs_ptr = meta.proof.as_ptr();
+                    response.proof_len = meta.proof.len();
+                    response.proof_ptr = meta.proof.as_ptr();
                     response.seal_status_code = FFISealStatus::Sealed;
                     response.sector_access = rust_str_to_c_str(meta.sector_access);
                     response.sector_id = meta.sector_id;
@@ -409,6 +396,7 @@ pub unsafe extern "C" fn get_seal_status(
     raw_ptr(response)
 }
 
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn get_sealed_sectors(
     ptr: *mut SectorBuilder,
@@ -467,6 +455,7 @@ pub unsafe extern "C" fn get_sealed_sectors(
     raw_ptr(response)
 }
 
+#[allow(dead_code)]
 #[no_mangle]
 pub unsafe extern "C" fn get_staged_sectors(
     ptr: *mut SectorBuilder,
@@ -535,106 +524,92 @@ pub unsafe extern "C" fn get_staged_sectors(
     raw_ptr(response)
 }
 
+unsafe fn try_into_post_proofs_bytes(
+    proof_partitions: u8,
+    flattened_proofs_ptr: *const u8,
+    flattened_proofs_len: libc::size_t,
+) -> crate::error::Result<Vec<Vec<u8>>> {
+    let chunk_size = proof_partitions as usize * SINGLE_PARTITION_PROOF_LEN;
+
+    ensure!(
+        flattened_proofs_len % chunk_size == 0,
+        "proofs array len={:?} incompatible with partitions={:?}",
+        flattened_proofs_len,
+        proof_partitions
+    );
+
+    Ok(into_proof_vecs(
+        chunk_size,
+        flattened_proofs_ptr,
+        flattened_proofs_len,
+    ))
+}
+
+unsafe fn try_into_porep_proof_bytes(
+    proof_ptr: *const u8,
+    proof_len: libc::size_t,
+) -> crate::error::Result<Vec<u8>> {
+    into_proof_vecs(proof_len, proof_ptr, proof_len)
+        .first()
+        .map(Vec::clone)
+        .ok_or_else(|| format_err!("no proofs in chunked vec"))
+}
+
+unsafe fn into_proof_vecs(
+    proof_chunk: usize,
+    flattened_proofs_ptr: *const u8,
+    flattened_proofs_len: libc::size_t,
+) -> Vec<Vec<u8>> {
+    from_raw_parts(flattened_proofs_ptr, flattened_proofs_len)
+        .iter()
+        .step_by(proof_chunk)
+        .fold(Default::default(), |mut acc: Vec<Vec<u8>>, item| {
+            let sliced = from_raw_parts(item, proof_chunk);
+            acc.push(sliced.to_vec());
+            acc
+        })
+}
+
+fn into_safe_challenge_seed(challenge_seed: &[u8; 32]) -> [u8; 32] {
+    let mut cs = [0; 32];
+    cs.copy_from_slice(challenge_seed);
+    cs[31] &= 0b00111111;
+    cs
+}
+
+unsafe fn into_commitments(
+    flattened_comms_ptr: *const u8,
+    flattened_comms_len: libc::size_t,
+) -> Vec<[u8; 32]> {
+    from_raw_parts(flattened_comms_ptr, flattened_comms_len)
+        .iter()
+        .step_by(32)
+        .fold(Default::default(), |mut acc: Vec<[u8; 32]>, item| {
+            let sliced = from_raw_parts(item, 32);
+            let mut x: [u8; 32] = Default::default();
+            x.copy_from_slice(&sliced[..32]);
+            acc.push(x);
+            acc
+        })
+}
+
 #[repr(C)]
 pub struct FFISectorClass {
-    sector_size: FFISectorSize,
-    seal_proof_partitions: FFISealProofPartitions,
-    post_proof_partitions: FFIPoStProofPartitions,
+    sector_size: u64,
+    porep_proof_partitions: u8,
+    post_proof_partitions: u8,
 }
 
-#[allow(non_camel_case_types)]
-#[derive(Clone, Debug, Copy)]
-#[repr(C)]
-pub enum FFISectorSize {
-    SSB_OneKiB,
-    SSB_TwoHundredFiftySixMiB,
-}
-
-#[allow(non_camel_case_types)]
-#[repr(C)]
-pub enum FFISealProofPartitions {
-    SPP_Two,
-}
-
-#[allow(non_camel_case_types)]
-#[repr(C)]
-pub enum FFIPoStProofPartitions {
-    PPP_One,
-}
-
-impl From<FFISectorSize> for SectorSize {
-    fn from(x: FFISectorSize) -> Self {
-        match x {
-            FFISectorSize::SSB_OneKiB => SectorSize::OneKiB,
-            FFISectorSize::SSB_TwoHundredFiftySixMiB => SectorSize::TwoHundredFiftySixMiB,
-        }
-    }
-}
-
-impl From<FFISealProofPartitions> for PoRepProofPartitions {
-    fn from(x: FFISealProofPartitions) -> Self {
-        match x {
-            FFISealProofPartitions::SPP_Two => PoRepProofPartitions::Two,
-        }
-    }
-}
-
-impl From<FFIPoStProofPartitions> for PoStProofPartitions {
-    fn from(x: FFIPoStProofPartitions) -> Self {
-        match x {
-            FFIPoStProofPartitions::PPP_One => PoStProofPartitions::One,
-        }
-    }
-}
-
-impl From<FFISectorClass> for SectorClass {
-    fn from(x: FFISectorClass) -> Self {
-        SectorClass::Live(
-            x.sector_size.into(),
-            x.seal_proof_partitions.into(),
-            x.post_proof_partitions.into(),
-        )
-    }
-}
-
-fn try_into_post_config(
-    ss: FFISectorSize,
-    post_proof: usize,
-) -> core::result::Result<PoStConfig, String> {
-    match (ss, post_proof) {
-        (FFISectorSize::SSB_OneKiB, _) => Ok(PoStConfig::Test),
-        (FFISectorSize::SSB_TwoHundredFiftySixMiB, n) => {
-            try_into_post_proof_partitions(n).map(|ppp| PoStConfig::Live(ss.into(), ppp))
-        }
-    }
-}
-
-fn try_into_porep_config(
-    ss: FFISectorSize,
-    proof_len: usize,
-) -> core::result::Result<PoRepConfig, String> {
-    match (ss, proof_len) {
-        (FFISectorSize::SSB_OneKiB, _) => Ok(PoRepConfig::Test),
-        (FFISectorSize::SSB_TwoHundredFiftySixMiB, n) => {
-            try_into_porep_proof_partitions(n).map(|ppp| PoRepConfig::Live(ss.into(), ppp))
-        }
-    }
-}
-
-fn try_into_post_proof_partitions(
-    post_proof_len: usize,
-) -> core::result::Result<PoStProofPartitions, String> {
-    match post_proof_len {
-        192 => Ok(PoStProofPartitions::One),
-        _ => Err(String::from("unsupported proof size")),
-    }
-}
-
-fn try_into_porep_proof_partitions(
-    porep_proof_len: usize,
-) -> core::result::Result<PoRepProofPartitions, String> {
-    match porep_proof_len {
-        384 => Ok(PoRepProofPartitions::Two),
-        _ => Err(String::from("unsupported proof size")),
+pub fn from_ffi_sector_class(fsc: FFISectorClass) -> SectorClass {
+    match fsc {
+        FFISectorClass {
+            sector_size,
+            porep_proof_partitions,
+            post_proof_partitions,
+        } => SectorClass(
+            SectorSize(sector_size),
+            PoRepProofPartitions(porep_proof_partitions),
+            PoStProofPartitions(post_proof_partitions),
+        ),
     }
 }
