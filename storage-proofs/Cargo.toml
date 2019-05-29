@@ -11,7 +11,7 @@ logging-toolkit = { path = "../logging-toolkit" }
 bitvec = "0.10"
 rand = "0.4"
 libc = "0.2"
-merkletree = "=0.4.0"
+merkletree = { git = "https://github.com/filecoin-project/merkle_light", branch = "merkletree-0.4.2"}
 failure = "0.1"
 byteorder = "1"
 config = "0.9.3"
@@ -33,21 +33,19 @@ rayon = "1.0.0"
 slog = { version = "2.4.1", features = ["max_level_trace", "release_max_level_trace"] }
 serde = { version = "1.0", features = ["derive"]}
 base64 = "0.10.0"
-blake2b_simd = "0.4.1"
-blake2s_simd = { git = "https://github.com/oconnor663/blake2s_simd", branch = "master"}
+blake2b_simd = "0.5"
+blake2s_simd = "0.5"
 toml = "0.5"
 ff = "0.4.0"
 bellperson = "0.2"
 paired = "0.15"
-
-[dependencies.sapling-crypto]
-git = "https://github.com/filecoin-project/sapling-crypto"
-branch = "master"
+fil-sapling-crypto = "0.1"
 
 [features]
 default = []
 simd = []
 asm = ["sha2/sha2-asm"]
+disk-trees = []
 
 [dev-dependencies]
 proptest = "0.7"

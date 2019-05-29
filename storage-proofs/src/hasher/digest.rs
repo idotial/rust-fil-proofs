@@ -4,12 +4,12 @@ use std::marker::PhantomData;
 
 use bellperson::{ConstraintSystem, SynthesisError};
 use ff::{PrimeField, PrimeFieldRepr};
+use fil_sapling_crypto::circuit::{boolean, num};
+use fil_sapling_crypto::jubjub::JubjubEngine;
 use merkletree::hash::{Algorithm, Hashable};
 use merkletree::merkle::Element;
 use paired::bls12_381::{Bls12, Fr, FrRepr};
 use rand::{Rand, Rng};
-use sapling_crypto::circuit::{boolean, num};
-use sapling_crypto::jubjub::JubjubEngine;
 use sha2::Digest;
 
 use super::{Domain, HashFunction, Hasher};
@@ -189,6 +189,10 @@ impl Element for DigestDomain {
             Ok(res) => res,
             Err(err) => panic!(err),
         }
+    }
+
+    fn copy_to_slice(&self, bytes: &mut [u8]) {
+        bytes.copy_from_slice(&self.0);
     }
 }
 
